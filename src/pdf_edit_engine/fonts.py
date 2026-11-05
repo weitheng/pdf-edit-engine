@@ -106,6 +106,59 @@ def _with_fonttools_translation(context: str) -> Iterator[None]:
         raise FontNotFoundError(f"font_extension_failed: {type(exc).__name__}") from exc
 
 
+def _best_cmap(tt: TTFont) -> dict[int, str]:
+    """Return the font's best Unicode cmap, or ``{}`` when it has no ``cmap`` table.
+
+    pdfkit (pdfmake) embeds TrueType subsets without a ``cmap`` table, and
+    older fontTools releases raise ``KeyError`` from ``getBestCmap()`` on them.
+
+    Args:
+        tt: A loaded fontTools ``TTFont``.
+
+    Returns:
+        A dict mapping Unicode codepoint to glyph name.
+    """
+    if "cmap" not in tt:
+        return {}
+    return tt.getBestCmap() or {}
+
+
+def _embedded_unicode_map(tt: TTFont, font_dict: pikepdf.Object) -> dict[int, str] | None:
+    """Return Unicode → glyph name for an embedded font, ``None`` when it cannot be told.
+
+    A font with a ``cmap`` table answers from it. A ``cmap``-less Type0 font
+    answers from its ``/ToUnicode`` when its encoding is ``/Identity-H`` and
+    its ``/CIDToGIDMap`` is ``/Identity`` or absent: a CID the ``/ToUnicode``
+    maps is then a glyph the subset holds. Any other ``cmap``-less font
+    returns ``None``.
+
+    Args:
+        tt: The embedded font, loaded from ``/FontFile2``.
+        font_dict: The top-level font dictionary that owns ``/ToUnicode``.
+
+    Returns:
+        A dict mapping Unicode codepoint to glyph name, or ``None``.
+    """
+    if "cmap" in tt:
+        return _best_cmap(tt)
+    if font_dict.get("/Subtype") != pikepdf.Name("/Type0"):
+        return None
+    if font_dict.get("/Encoding") != pikepdf.Name("/Identity-H"):
+        return None
+    descendants = font_dict.get("/DescendantFonts")
+    if descendants is None or len(descendants) == 0:
+        return None
+    cid_to_gid = descendants[0].get("/CIDToGIDMap")
+    if cid_to_gid is not None and cid_to_gid != pikepdf.Name("/Identity"):
+        return None
+    glyph_count = len(tt.getGlyphOrder())
+    coverage: dict[int, str] = {}
+    for cid, text in sorted(_parse_existing_tounicode(font_dict).items()):
+        if len(text) == 1 and 0 < cid < glyph_count:
+            coverage.setdefault(ord(text), tt.getGlyphName(cid))
+    return coverage
+
+
 # ── Public coverage helper (used by encoding.FontResolver.can_encode) ────
 
 
@@ -122,9 +175,11 @@ def font_has_codepoint(
 
     Algorithm: load the /FontFile2 via fontTools, get its best cmap,
     and check whether ``codepoint`` maps to a glyph name present in
-    ``getGlyphOrder()``. Returns True (best-effort) when /FontFile2 is
-    absent or unparseable so that can_encode does not regress on fonts
-    where coverage cannot be verified.
+    ``getGlyphOrder()``; a font with no cmap table answers from its
+    ``/ToUnicode`` (see :func:`_embedded_unicode_map`), or reads as an empty
+    cmap when that cannot tell. Returns True (best-effort) when /FontFile2 is
+    absent or unparseable so that can_encode does not regress on fonts where
+    coverage cannot be verified.
 
     No caching: a prior implementation kept a module-global
     ``_FONTFILE2_CACHE`` keyed on ``(id(pdf), *objgen)`` to avoid
@@ -181,7 +236,7 @@ def font_has_codepoint(
         with _with_fonttools_translation("font_has_codepoint"):
             tt = TTFont(io.BytesIO(font_bytes))
             try:
-                best_cmap = tt.getBestCmap() or {}
+                best_cmap = _embedded_unicode_map(tt, font_dict) or {}
                 glyph_order = set(tt.getGlyphOrder())
                 covered: set[int] = {cp for cp, gname in best_cmap.items() if gname in glyph_order}
                 if codepoint in covered:
@@ -456,7 +511,7 @@ def reverse_embedded_cmap(ttfont: TTFont) -> dict[int, str]:
         A dict mapping CID (int) to a single-character Unicode string. Empty
         when the font exposes no usable best cmap.
     """
-    best = ttfont.getBestCmap() or {}
+    best = _best_cmap(ttfont)
     cid_to_unicode: dict[int, str] = {}
     for codepoint, glyph_name in best.items():
         try:
@@ -1139,6 +1194,8 @@ def _append_glyph_to_font(
     embedded: TTFont,
     system: TTFont,
     glyph_name: str,
+    target_name: str | None = None,
+    renamed: dict[str, str] | None = None,
 ) -> int:
     """Append a single glyph (by name) from system to embedded at a fresh GID.
 
@@ -1152,6 +1209,10 @@ def _append_glyph_to_font(
         embedded: Destination TTFont.
         system: Source TTFont.
         glyph_name: Glyph name to copy (must exist in system["glyf"]).
+        target_name: Name to store the copy under in embedded; defaults to
+            ``glyph_name``.
+        renamed: Donor component name → embedded name, applied to the
+            components of a composite copy.
 
     Returns:
         The new GID assigned in embedded.
@@ -1161,17 +1222,54 @@ def _append_glyph_to_font(
     system_glyph = system["glyf"][glyph_name]
     new_glyph = copy.deepcopy(system_glyph)
     _strip_glyph_hinting(new_glyph)
+    if renamed:
+        for component in getattr(new_glyph, "components", []):
+            component.glyphName = renamed.get(component.glyphName, component.glyphName)
 
     # Assigning to glyf[name] auto-appends the name to the glyph order
     # when the name is new. hmtx assignment does not.
-    embedded["glyf"][glyph_name] = new_glyph
+    name = target_name or glyph_name
+    embedded["glyf"][name] = new_glyph
 
     advance, lsb = system["hmtx"][glyph_name]
-    embedded["hmtx"][glyph_name] = (advance, lsb)
+    embedded["hmtx"][name] = (advance, lsb)
 
     order = list(embedded.getGlyphOrder())
     embedded["maxp"].numGlyphs = len(order)
-    return order.index(glyph_name)
+    return order.index(name)
+
+
+def _has_stored_glyph_names(tt: TTFont) -> bool:
+    """Return True iff the font's glyph names come from its ``post`` table.
+
+    Without ``post`` names (no ``post`` table, or format 3) fontTools makes
+    names up as ``glyphNNNNN`` from the GID, so the same name in two fonts
+    says nothing about the glyphs being the same.
+
+    Args:
+        tt: A loaded fontTools ``TTFont``.
+
+    Returns:
+        True when the ``post`` table is format 1 or 2.
+    """
+    return "post" in tt and tt["post"].formatType in (1.0, 2.0)
+
+
+def _unused_glyph_name(embedded: TTFont, base: str) -> str:
+    """Return ``base`` suffixed so that no glyph in ``embedded`` has the name.
+
+    Args:
+        embedded: The font the name must be new in.
+        base: The donor glyph name to derive from.
+
+    Returns:
+        A glyph name absent from ``embedded``'s glyph order.
+    """
+    taken = set(embedded.getGlyphOrder())
+    n = 1
+    while f"{base}.inj{n}" in taken:
+        n += 1
+    return f"{base}.inj{n}"
 
 
 def _inject_glyph_in_place(
@@ -1183,11 +1281,14 @@ def _inject_glyph_in_place(
 
     Copies the glyph outline and hmtx entry for a single Unicode
     character ``ch`` from ``system`` into ``embedded``. For composite
-    glyphs, recursively injects component glyphs first. Strips hinting
-    bytecode from injected glyphs.
+    glyphs, recursively injects component glyphs first; a glyph already in
+    ``embedded`` under the same name is reused only when both fonts store
+    their glyph names (:func:`_has_stored_glyph_names`), otherwise the copy
+    is appended under an unused name. Strips hinting bytecode from injected
+    glyphs.
 
-    Updates the embedded font's ``glyf``, ``hmtx``, internal ``cmap``,
-    ``glyph order``, and ``maxp.numGlyphs``. Does NOT modify the PDF
+    Updates the embedded font's ``glyf``, ``hmtx``, internal ``cmap`` (when
+    it has one), ``glyph order``, and ``maxp.numGlyphs``. Does NOT modify the PDF
     font dictionary or ToUnicode/W — that is the caller's responsibility.
 
     Args:
@@ -1221,28 +1322,45 @@ def _inject_glyph_in_place(
             f"system={system_upem}. Tier 1.5 does not rescale outlines."
         )
 
-    system_cmap = system.getBestCmap() or {}
+    system_cmap = _best_cmap(system)
     cp = ord(ch)
     if cp not in system_cmap:
         raise FontNotFoundError(f"character {ch!r} (U+{cp:04X}) not in system font cmap")
     glyph_name = system_cmap[cp]
     system_glyph = system["glyf"][glyph_name]
 
+    reuse_by_name = _has_stored_glyph_names(embedded) and _has_stored_glyph_names(system)
+    renamed: dict[str, str] = {}
+
     # Recursively inject composite components (leaves first)
     components = _collect_component_names(system_glyph, system)
     for comp_name in components:
-        if comp_name in list(embedded.getGlyphOrder()):
+        present = comp_name in embedded.getGlyphOrder()
+        if present and reuse_by_name:
             continue
         if comp_name not in system["glyf"].glyphs:
             raise FontNotFoundError(f"composite component {comp_name!r} missing from system font")
-        _append_glyph_to_font(embedded, system, comp_name)
+        if present:
+            renamed[comp_name] = _unused_glyph_name(embedded, comp_name)
+        _append_glyph_to_font(
+            embedded, system, comp_name, target_name=renamed.get(comp_name), renamed=renamed
+        )
 
     # Inject the top-level glyph (caller ensures it is not already present)
-    if glyph_name in list(embedded.getGlyphOrder()):
+    present = glyph_name in embedded.getGlyphOrder()
+    if present and reuse_by_name:
         # Glyph name already in embedded font; just update cmap below
         new_gid = list(embedded.getGlyphOrder()).index(glyph_name)
     else:
-        new_gid = _append_glyph_to_font(embedded, system, glyph_name)
+        if present:
+            renamed[glyph_name] = _unused_glyph_name(embedded, glyph_name)
+        new_gid = _append_glyph_to_font(
+            embedded, system, glyph_name, target_name=renamed.get(glyph_name), renamed=renamed
+        )
+    glyph_name = renamed.get(glyph_name, glyph_name)
+
+    if "cmap" not in embedded:
+        return new_gid
 
     # Update embedded cmap: Unicode -> glyph name (BMP Unicode table preferred)
     updated = False
@@ -1416,7 +1534,7 @@ def _inject_cff_glyph_in_place(
 
     # 5. Resolve donor glyph + reject composite/seac.
     cp = ord(ch)
-    s_cmap = system.getBestCmap() or {}
+    s_cmap = _best_cmap(system)
     if cp not in s_cmap:
         raise FontNotFoundError(f"character {ch!r} (U+{cp:04X}) not in donor cmap")
     donor_name = s_cmap[cp]
@@ -1534,7 +1652,8 @@ def analyze_subset(pdf_path: str | Path, font_name: str) -> FontInfo:
 
     Returns:
         FontInfo with subset details including glyph count, encoding type,
-        and font_cmap populated with the embedded font's cmap table.
+        and font_cmap populated with the embedded font's cmap table (its
+        /ToUnicode coverage when the subset has no cmap table).
 
     Raises:
         FontNotFoundError: If the font or its embedded data is not found.
@@ -1606,7 +1725,7 @@ def _analyze_from_page(
         with _with_fonttools_translation(f"analyze_subset:{font_name}"):
             font = TTFont(io.BytesIO(font_bytes))
             try:
-                font_cmap = font.getBestCmap()
+                font_cmap = _embedded_unicode_map(font, font_dict)
             finally:
                 font.close()
 
@@ -1787,7 +1906,7 @@ def extend_subset(
     with _with_fonttools_translation(f"extend_subset:{font_name}"):
         embedded_font = TTFont(io.BytesIO(font_bytes))
         try:
-            embedded_cmap = embedded_font.getBestCmap() or {}
+            embedded_cmap = _embedded_unicode_map(embedded_font, font_dict) or {}
 
             # Split additional_chars into two groups:
             #   tier1_chars  - glyph already in embedded font, only needs a
@@ -2031,14 +2150,14 @@ def _extend_tier2(
                 cp = ord(ch)
                 # Skip if already in the embedded cmap (defensive — caller
                 # should have routed through Tier 1 first).
-                if cp in (embedded.getBestCmap() or {}):
+                if cp in _best_cmap(embedded):
                     continue
                 new_gid = _inject_glyph_in_place(embedded, system, ch)
 
                 new_cmap_entries[new_gid] = ch
                 # Width comes from the newly-injected glyph's hmtx entry
                 # (which we just copied from the system font).
-                glyph_name = (system.getBestCmap() or {})[cp]
+                glyph_name = _best_cmap(system)[cp]
                 raw_w = float(system["hmtx"][glyph_name][0])
                 new_w_entries[new_gid] = raw_w * 1000.0 / units_per_em
 
@@ -2172,7 +2291,7 @@ def _extend_cff_tier(
                     continue
                 new_gid = _inject_cff_glyph_in_place(embedded, donor, ch, min_cid=min_cid)
                 new_cmap_entries[new_gid] = ch
-                donor_cmap = donor.getBestCmap() or {}
+                donor_cmap = _best_cmap(donor)
                 donor_name = donor_cmap[cp]
                 raw_w = float(donor["hmtx"][donor_name][0])
                 new_w_entries[new_gid] = raw_w * 1000.0 / units_per_em
@@ -2396,6 +2515,11 @@ def _extend_simple_tier_one_five(
         )
         system = _open_system_ttfont(system_path, substituted_name or ps_name)
         try:
+            if "cmap" not in embedded:
+                raise FontNotFoundError(
+                    f"embedded font {ps_name} has no cmap table to map the new "
+                    f"bytes through; simple-font glyph injection needs one. Refusing."
+                )
             # 6. Inject glyphs for both groups; collect (byte, glyph_name, width).
             # _glyph_width_from_hmtx raises FontNotFoundError on missing
             # glyph_name (indicates _inject_glyph_in_place partial-failed)

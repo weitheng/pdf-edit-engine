@@ -75,6 +75,13 @@ MANIFEST: list[dict[str, object]] = [
         "features": ["CIDFont", "real-world", "multiple font families"],
         "expected_text": "EXPERIENCE",
     },
+    {
+        "filename": "pdfmake_roboto.pdf",
+        "generator": "pdfmake 0.3.11 (pdfkit), bundled Roboto",
+        "encoding": "Identity-H",
+        "features": ["CIDFont", "real-world", "FontFile2 without cmap", "Turkish", "table"],
+        "expected_text": "Konyaaltı şubesi",
+    },
 ]
 
 

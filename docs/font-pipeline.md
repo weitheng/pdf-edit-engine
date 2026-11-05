@@ -27,6 +27,12 @@ The `extend_subset` entry point at `fonts.py` splits the input
 and `tier15_chars` (not in the embedded cmap), applies Tier 1 to the
 first group, then Tier 1.5 to the second group if any remain.
 
+An embedded TrueType subset with no `cmap` table (pdfkit / pdfmake
+writes these) has its coverage read from the `/ToUnicode` instead,
+when the font is Identity-H with an Identity `/CIDToGIDMap`: a CID the
+`/ToUnicode` maps is a glyph the subset holds. Tier 1.5 then injects
+without touching the absent `cmap`.
+
 ### Why the name "Tier 1.5"?
 
 v0.1.0 shipped a different Tier 2 strategy that re-embedded a fresh

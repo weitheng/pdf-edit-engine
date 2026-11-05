@@ -21,6 +21,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   opens with no password; and a non-ASCII password still opens the output.
   The one scheme change is qpdf's: an R 4 file whose crypt filters use RC4
   is written with AES-128 under the same key.
+- **PDFs written by pdfmake / pdfkit can be searched and edited.** pdfkit
+  embeds its TrueType subsets with no `cmap` table. With fontTools releases
+  that raise `KeyError` from `getBestCmap()` on such a font, the locator
+  dropped every run in it, so `find()` returned nothing and `replace_all()`
+  returned `[]`; with any fontTools, a replacement needing a letter the
+  subset lacked crashed with `KeyError: 'cmap'` in glyph injection. A
+  cmap-less font now reads as an empty cmap, and its coverage comes from
+  the `/ToUnicode` when the font is Identity-H with an Identity
+  `/CIDToGIDMap`. A new letter is injected from the system font (or
+  `full_font_path`) as for any other subset, and without one the edit
+  fails with the usual `font_extension_failed` Degradation. A simple
+  TrueType font with no `cmap` reads as covering nothing, so a replacement
+  in it fails with `font_extension_failed`, since nothing maps its bytes to
+  the glyphs.
+- **Glyph injection no longer reuses an unrelated subset glyph as a
+  composite's component.** When the subset or the donor font stores no
+  glyph names (no `post` table, or format 3), fontTools names their glyphs
+  `glyphNNNNN` by GID, and a donor component was taken to be already
+  present whenever the subset had a glyph at the same GID, so a letter such
+  as `½` drew other glyphs. Such components are now appended under unused
+  names.
 
 ## [0.2.0] — 2026-06-02
 

@@ -226,6 +226,7 @@ diagnose_output/
 
 # Test corpus PDFs (auto-generated per platform — includes personal resume)
 tests/corpus/*.pdf
+!tests/corpus/pdfmake_roboto.pdf
 
 # MCP config (contains local paths)
 .mcp.json
