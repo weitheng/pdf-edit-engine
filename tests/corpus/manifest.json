@@ -84,5 +84,17 @@
       "table"
     ],
     "expected_text": "Konyaaltı şubesi"
+  },
+  {
+    "filename": "pdfmake_noto_cjk.pdf",
+    "generator": "pdfmake 0.3.11 (pdfkit), bundled Roboto, Noto Sans CJK SC 2.004",
+    "encoding": "Identity-H",
+    "features": [
+      "CIDFont",
+      "real-world",
+      "CID-keyed CFF with several FontDicts",
+      "Chinese"
+    ],
+    "expected_text": "TXE-2026-114"
   }
 ]

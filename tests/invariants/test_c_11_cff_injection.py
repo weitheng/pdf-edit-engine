@@ -16,8 +16,9 @@ matching ``unitsPerEm`` is INJECTED (new helper
 the donor glyph at a fresh CID == GID at the additive tail (pre-existing CIDs
 untouched, mirroring the ARY-278 no-renumber discipline for ``glyf``). Every
 OTHER shape (CFF2, composite/seac donor, TrueType ``glyf`` donor, ``unitsPerEm``
-mismatch, multi-FD, name-keyed non-ROS) still HARD-FAILS via
+mismatch, name-keyed non-ROS) still HARD-FAILS via
 ``FontNotFoundError`` (in ``_FONT_EXTEND_FAIL_EXCS``) → ``font_extension_failed``.
+A font with several FontDicts, refused at first, is injected too (case g).
 ``extend_subset`` returns ``"full_extension"`` on success, which the existing
 surgeon/reflow/structural funnel already maps to a ``font_coverage_substituted``
 Degradation + ``success=True`` + ``font_preserved=True``.
@@ -831,3 +832,186 @@ def _embedded_cff_topdict_from_bytes(raw: bytes) -> tuple[object, object]:
     cff = CFFFontSet()
     cff.decompile(io.BytesIO(raw), None)
     return cff, cff[cff.fontNames[0]]
+
+
+# ── (g) a font with several FontDicts (Noto Sans CJK keeps one per class) ──
+
+_LATIN_PRIVATE: dict[str, object] = {
+    "BlueValues": [-12, 0, 700, 712],
+    "StdHW": 40,
+    "StdVW": 40,
+    "defaultWidthX": 500,
+}
+_IDEOGRAPH_PRIVATE: dict[str, object] = {
+    "BlueValues": [-250, -250, 1100, 1100],
+    "StdHW": 58,
+    "StdVW": 63,
+    "LanguageGroup": 1,
+    "defaultWidthX": 1000,
+    "nominalWidthX": 107,
+}
+_PROPORTIONAL_PRIVATE: dict[str, object] = {
+    "BlueValues": [-14, 0, 543, 557],
+    "StdHW": 50,
+    "StdVW": 60,
+    "defaultWidthX": 742,
+    "nominalWidthX": 617,
+}
+
+
+def _multi_fd_cid_cff(
+    chars: list[str],
+    ps_name: str,
+    privates: list[dict[str, object]],
+    fd_of_char: dict[str, int],
+    *,
+    distinct_outline: bool = False,
+    advance: int = 500,
+) -> object:
+    """A CID-keyed CFF ``TTFont`` whose glyphs sit under FontDicts of their own."""
+    from fontTools.cffLib import PrivateDict  # type: ignore[import-untyped]
+
+    from tests.corpus_builders.cff_cid_injection import _build_cid_keyed_cff_ttfont
+
+    font = _build_cid_keyed_cff_ttfont(
+        chars, ps_name, num_fd=len(privates), distinct_outline=distinct_outline
+    )
+    cff = font["CFF "].cff  # type: ignore[index]
+    td = cff[cff.fontNames[0]]
+    for font_dict, values in zip(td.FDArray, privates, strict=True):
+        private = PrivateDict()
+        for key, value in values.items():
+            setattr(private, key, value)
+        font_dict.Private = private
+    td.FDSelect.gidArray = [0] + [fd_of_char[c] for c in chars]
+    for gid, name in enumerate(font.getGlyphOrder()):  # type: ignore[attr-defined]
+        td.CharStrings[name].private = td.FDArray[td.FDSelect.gidArray[gid]].Private
+        if name != ".notdef":
+            font["hmtx"][name] = (advance, 0)  # type: ignore[index]
+    return font
+
+
+def _multi_fd_pdf(tmp_path: Path) -> Path:
+    """'AB' in a bare CID-keyed CFF: A under a Latin FontDict, B under an ideograph one."""
+    from tests.corpus_builders.cff_cid_injection import (
+        _assemble_cid_cff_pdf,
+        _bare_cff_from_ttfont,
+    )
+
+    font = _multi_fd_cid_cff(
+        ["A", "B"], "SynthMultiFD-Regular", [_LATIN_PRIVATE, _IDEOGRAPH_PRIVATE], {"A": 0, "B": 1}
+    )
+    try:
+        cff_bytes = _bare_cff_from_ttfont(font)
+    finally:
+        font.close()  # type: ignore[attr-defined]
+    src = tmp_path / "multi_fd.pdf"
+    _assemble_cid_cff_pdf(
+        cff_bytes,
+        subtype="/Type1C",
+        ps_name="SynthMultiFD-Regular",
+        cid_to_unicode={1: ord("A"), 2: ord("B")},
+        content_cids=[1, 2],
+        out_path=src,
+    )
+    return src
+
+
+def _multi_fd_donor(tmp_path: Path, donor_private: dict[str, object], advance: int) -> str:
+    """A donor whose 'C' (a triangle) sits under a FontDict with ``donor_private``."""
+    from tests.corpus_builders.cff_cid_injection import _sfnt_bytes_from_ttfont
+
+    font = _multi_fd_cid_cff(
+        ["C"],
+        "SynthMultiFDDonor-Regular",
+        [_LATIN_PRIVATE, donor_private],
+        {"C": 1},
+        distinct_outline=True,
+        advance=advance,
+    )
+    try:
+        return _write_donor(tmp_path, "multi_fd_donor.otf", _sfnt_bytes_from_ttfont(font))
+    finally:
+        font.close()  # type: ignore[attr-defined]
+
+
+def _drawn(charstring: object) -> tuple[list[object], float]:
+    """Return a Type 2 charstring's outline and the width it decodes to."""
+    from fontTools.pens.recordingPen import RecordingPen  # type: ignore[import-untyped]
+
+    pen = RecordingPen()
+    charstring.draw(pen)  # type: ignore[attr-defined]
+    return pen.value, charstring.width  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("donor_private", "advance", "expected_fd"),
+    [
+        pytest.param(_IDEOGRAPH_PRIVATE, 1000, 1, id="own_fontdict_default_width"),
+        pytest.param(_IDEOGRAPH_PRIVATE, 900, 1, id="own_fontdict_nominal_width"),
+        pytest.param(_PROPORTIONAL_PRIVATE, 600, 0, id="fontdict_the_subset_lacks"),
+    ],
+)
+def test_inv_c_11_multi_fd_glyph_lands_under_the_donor_glyphs_fontdict(
+    tmp_path: Path, donor_private: dict[str, object], advance: int, expected_fd: int
+) -> None:
+    """INV-C-11: a CID-keyed CFF with several FontDicts takes the glyph too.
+
+    The new glyph is filed under the FontDict whose Private dict is the donor
+    glyph's (FD 0 when the subset has none such), and its width operand is
+    encoded against that Private dict, so it decodes to the donor's advance.
+    Pre-existing glyphs keep their FontDicts.
+    """
+    src = _multi_fd_pdf(tmp_path)
+    donor_path = _multi_fd_donor(tmp_path, donor_private, advance)
+    out = tmp_path / "multi_fd_out.pdf"
+
+    pdf = open_pdf(str(src))
+    try:
+        assert extend_subset(pdf, pdf.pages[0], "F1", "C", full_font_path=donor_path) == (
+            "full_extension"
+        )
+        pdf.save(str(out))
+    finally:
+        pdf.close()
+
+    _cff, td = _embedded_cff_topdict_from_bytes(_extract_fontfile3_after_edit(str(out)))
+    assert list(td.charset) == [".notdef", "cid00001", "cid00002", _NEW_NAME]  # type: ignore[attr-defined]
+    assert list(td.FDSelect.gidArray) == [0, 0, 1, expected_fd], (  # type: ignore[attr-defined]
+        "INV-C-11 violation: the injected glyph must sit under the donor glyph's "
+        "FontDict, and the pre-existing glyphs under theirs"
+    )
+    _donor_cff, donor_td = _embedded_cff_topdict_from_bytes(
+        open(donor_path, "rb").read()  # noqa: PTH123, SIM115
+    )
+    donor_outline, _ = _drawn(donor_td.CharStrings["cid00001"])  # type: ignore[attr-defined]
+    outline, width = _drawn(td.CharStrings[_NEW_NAME])  # type: ignore[attr-defined]
+    assert outline == donor_outline, "INV-C-11 violation: the injected outline is not the donor's"
+    assert width == advance, (
+        f"INV-C-11 violation: the injected charstring decodes to width {width}, not the "
+        f"donor's advance {advance}"
+    )
+
+
+def test_inv_c_11_public_replace_on_multi_fd_cff_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INV-C-11: ``replace`` 'AB'->'ABC' on a CFF with several FontDicts SUCCEEDS.
+
+    Before, the injector refused every font whose FDArray held more than one
+    FontDict ("multi-FD CID CFF is unsupported"), and Noto Sans CJK subsets
+    always hold several.
+    """
+    src = _multi_fd_pdf(tmp_path)
+    out = tmp_path / "multi_fd_out.pdf"
+    _install_cff_donor(monkeypatch, _multi_fd_donor(tmp_path, _IDEOGRAPH_PRIVATE, 1000))
+
+    result = pdf_edit_engine.replace(
+        str(src), pdf_edit_engine.find(str(src), "AB")[0], "ABC", str(out)
+    )
+
+    assert result.success, (
+        "INV-C-11 violation: replace on a multi-FD CID-keyed CFF failed; "
+        f"degradations={[d.kind for d in result.fidelity_report.degradations]}"
+    )
+    assert pdf_edit_engine.get_text(str(out)).strip() == "ABC"

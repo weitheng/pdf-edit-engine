@@ -42,6 +42,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   present whenever the subset had a glyph at the same GID, so a letter such
   as `½` drew other glyphs. Such components are now appended under unused
   names.
+- **Chinese, Japanese and Korean characters a pdfmake PDF lacks can be
+  added.** pdfkit embeds a CJK OpenType font such as Noto Sans CJK as a bare
+  CID-keyed CFF subset that keeps the FontDict of each glyph class its
+  glyphs use, and the CFF injector refused any font with more than one
+  FontDict (`multi-FD CID CFF is unsupported`), so a replacement needing a
+  character the subset lacked failed with `font_extension_failed`. The new
+  glyph now goes under the FontDict whose Private dict is the donor glyph's
+  (FD 0 when the subset has none such), and its charstring width is encoded
+  against that Private dict's `nominalWidthX` and `defaultWidthX`; the raw
+  advance it was written as decoded to the advance plus `nominalWidthX`
+  (the `/W` width viewers draw with was right).
+- **A CJK subset whose `/ToUnicode` maps one CID to several characters can
+  be extended.** fontkit writes such entries for Noto Sans CJK ligatures
+  (`——` between ideographs, `fi` in a CJK run), and the CFF injector raised
+  `TypeError` on them instead of adding the character or failing with
+  `font_extension_failed`. Those entries are now left out of the
+  character-to-CID lookup, as the TrueType path already did.
 
 ## [0.2.0] — 2026-06-02
 

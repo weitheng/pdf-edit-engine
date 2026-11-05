@@ -139,14 +139,17 @@ resolver together.
 ## Known limitations
 
 - **CID-keyed (Type0) CFF / Type1C injection IS supported (v0.2.0, C.3).**
-  A CID-keyed (`ROS`), single-FD, `glyf`-free CFF embedded as
+  A CID-keyed (`ROS`), `glyf`-free CFF embedded as
   `/FontFile3` (including a bare `/Type1C`) whose donor is a
   non-composite CFF of matching `unitsPerEm` is injected in place by
   `_inject_cff_glyph_in_place` — the Type2-charstring sibling of the
   `glyf` Tier 1.5 `_inject_glyph_in_place`. The donor outline is drawn
   into the embedded CFF context with a `T2CharStringPen` and appended
   at a collision-free `CID == GID` at the additive tail; pre-existing
-  CIDs are never renumbered (INV-C-11/12/13).
+  CIDs are never renumbered (INV-C-11/12/13). A font with several
+  FontDicts (pdfkit keeps one per Noto Sans CJK glyph class it uses)
+  files the glyph under the FontDict whose Private dict is the donor
+  glyph's, else FD 0, and encodes its width against that Private dict.
 - **Other CFF shapes are not supported and refuse honestly.**
   Outline-table classification (INV-C-9, C.1) drives the dispatch: the
   pure `_classify_outline_table` at `fonts.py` sniffs the table the
@@ -159,10 +162,10 @@ resolver together.
   write path surfaces an honest `font_extension_failed` Degradation with
   `success=False`, never a raw `KeyError('/FontFile2')`) for every shape
   the C.3 slice does not cover: CFF2, name-keyed (non-`ROS`) CFF,
-  multi-FD CID, composite/seac donors, a TrueType donor for a CFF
-  target, and `unitsPerEm` mismatch. The simple-font path
+  composite/seac donors, a TrueType donor for a CFF target, and
+  `unitsPerEm` mismatch. The simple-font path
   (`_extend_simple_tier_one_five`) still rejects `/FontFile3`. CFF
-  outline-VALUE conversion (e.g. Separation tints), CFF2, multi-FD, and
+  outline-VALUE conversion (e.g. Separation tints), CFF2, and
   composite donors remain deferred (ARY-279 follow-ups).
 - **Type 3 fonts (bitmap/procedural) are not supported** for extension.
 - **unitsPerEm mismatch** between the embedded and system font is

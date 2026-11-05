@@ -22,8 +22,8 @@
 ## Font handling
 
 - Tier 1.5 font extension (in-place glyph injection) requires the matching system font (or a metric-equivalent fallback like Carlito for Calibri) to be installed; the resolved substitute name is surfaced through `FidelityReport.font_substituted` AND a `font_coverage_substituted` Degradation (v0.1.3)
-- CID-keyed (Type0) CFF / Type1C embedded fonts ARE extended in place as of v0.2.0 (C.3 — `_inject_cff_glyph_in_place`, the Type2-charstring sibling of the TrueType `glyf` injector; collision-free `CID == GID`, pre-existing CIDs preserved). Out-of-scope CFF shapes (simple-font/non-CID CFF, CFF2, name-keyed CFF, multi-FD CID, composite donors, `unitsPerEm` mismatch) refuse honestly via a `font_extension_failed` Degradation (`success=False`)
-- CJK fonts with 30,000+ glyphs have not been tested
+- CID-keyed (Type0) CFF / Type1C embedded fonts ARE extended in place as of v0.2.0 (C.3 — `_inject_cff_glyph_in_place`, the Type2-charstring sibling of the TrueType `glyf` injector; collision-free `CID == GID`, pre-existing CIDs preserved). A CID-keyed CFF with several FontDicts (pdfkit's Noto Sans CJK subsets) takes the glyph under the FontDict whose Private dict is the donor glyph's. Out-of-scope CFF shapes (simple-font/non-CID CFF, CFF2, name-keyed CFF, composite donors, `unitsPerEm` mismatch) refuse honestly via a `font_extension_failed` Degradation (`success=False`)
+- CJK fonts with 30,000+ glyphs have been tested only as the donor of glyphs injected into a subset (Noto Sans CJK SC, 65,535 glyphs, in `tests/test_pdfmake_fonts.py` when the font is installed)
 - Type 3 fonts (bitmap/procedural) are not supported for extension
 - Emoji and other multi-codepoint characters cannot be rendered if the font lacks those glyphs (reported via `FidelityReport.degradations` as `font_extension_failed`)
 - Non-CID font extension is supported for **simple TrueType + WinAnsi + `/FontFile2`** fonts (Phase 13). Replacements requiring missing glyphs trigger `_extend_simple_tier_15`, which sources the outline from a system font (or metric-equivalent fallback like Carlito for Calibri) and surfaces via `FidelityReport.font_substituted` AND a `font_coverage_substituted` Degradation. Still NOT supported on the simple-font path: `/FontFile3` (CFF/OpenType) outlines — note that CID-keyed (Type0) CFF/Type1C IS injected as of v0.2.0 (C.3); this remaining gap is the non-CID simple-font case only; `/Type1` fonts (would require Type1 charstring surgery — out of scope); MacRoman simple fonts (architecturally similar to WinAnsi but untested); simple TrueType fonts whose `/FontFile2` has no `cmap` table; CJK fonts with 30,000+ glyphs (untested). The dispatcher in `extend_subset()` raises `FontNotFoundError` for all these cases.
@@ -73,9 +73,11 @@ Identity-H CIDFont PDFs (Chrome, Google Docs, Word) may be slower due to CMap pa
 - The library is **not thread-safe**. Caches (`FontResolverCache`,
   `GlyphWidthCache`) and the public `pikepdf.Pdf` handle returned by
   `_pathutil.open_pdf` are designed for single-threaded use. As of v0.1.2
-  (ARY-283) every public entrypoint constructs fresh per-call caches —
-  there is no shared module-level state that two threads could race on
-  inside the engine — but the underlying `pikepdf.Pdf` object, the
+  (ARY-283) every public entrypoint constructs fresh per-call caches,
+  but the locator's page index cache (`_cached_path` /
+  `_cached_elements` in `locator.py`) is module-level, so two threads
+  running `find` or `replace_all` at once can miss text that is there.
+  The underlying `pikepdf.Pdf` object, the
   page-level mutations performed by `surgeon` and `structural`, and the
   `fontTools.ttLib.TTFont` instances loaded inside `fonts.extend_subset`
   are not safe to share across threads.

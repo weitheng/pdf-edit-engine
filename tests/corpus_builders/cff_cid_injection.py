@@ -146,8 +146,8 @@ def _build_cid_keyed_cff_ttfont(
         upem: unitsPerEm (parameterised for the UPEM-mismatch INV-C-13 case).
         distinct_outline: When True every non-``.notdef`` glyph is the donor
             triangle; otherwise the embedded box.
-        num_fd: Number of FontDicts in the FDArray. 1 is the supported
-            slice-1 shape; >1 builds the multi-FD out-of-scope refusal case.
+        num_fd: Number of FontDicts in the FDArray, all sharing one Private
+            dict; every glyph routes to FD 0.
 
     Returns:
         A ``fontTools.ttLib.TTFont`` with a genuinely CID-keyed ``CFF `` table.
@@ -191,8 +191,7 @@ def _build_cid_keyed_cff_ttfont(
     td.CIDCount = len(glyph_names)
     td.charset = list(glyph_names)
 
-    # FDArray: one or more FontDicts. The slice-1 supported shape has exactly
-    # one; num_fd > 1 builds the multi-FD out-of-scope refusal case.
+    # FDArray: one or more FontDicts sharing one Private dict.
     fd_array = FDArrayIndex()
     base_private = td.Private
     for _ in range(max(1, num_fd)):

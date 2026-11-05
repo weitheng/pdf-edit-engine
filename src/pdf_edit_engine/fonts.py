@@ -469,7 +469,11 @@ def _cff_has_codepoint(
         if hasattr(top_dict, "ROS"):
             # CID-keyed: resolve codepoint → CID via /ToUnicode, then check
             # the cidNNNNN name is in the charset.
-            reverse = {ord(u): cid for cid, u in _parse_existing_tounicode(font_dict).items()}
+            reverse = {
+                ord(u): cid
+                for cid, u in _parse_existing_tounicode(font_dict).items()
+                if len(u) == 1
+            }
             cid = reverse.get(codepoint)
             if cid is None:
                 return False  # no embedded CID assigned this codepoint
@@ -1434,6 +1438,25 @@ def _cff_cid_from_charset_name(name: str) -> int | None:
         return None
 
 
+def _cff_private_values(private: object) -> dict[str, object]:
+    """Return a CFF Private dict's values, defaults included, without its ``Subrs``.
+
+    Two Private dicts with equal values carry the same hint zones and width
+    defaults, which is how :func:`_inject_cff_glyph_in_place` tells which
+    FontDict of a subset came from the donor glyph's: a subsetter copies the
+    Private dicts it keeps but narrows their ``Subrs``.
+
+    Args:
+        private: A ``fontTools.cffLib.PrivateDict``.
+
+    Returns:
+        A dict mapping each Private dict operator name to its value; empty for
+        a charstring with no Private dict, which then matches no FontDict.
+    """
+    order = getattr(private, "order", ())
+    return {key: getattr(private, key, None) for key in order if key != "Subrs"}
+
+
 def _inject_cff_glyph_in_place(
     embedded: TTFont,
     system: TTFont,
@@ -1474,11 +1497,18 @@ def _inject_cff_glyph_in_place(
     :func:`_pad_glyph_order`. Pre-existing charstrings / charset entries stay
     byte-identical (the injection is append-only beyond the pad).
 
+    **FontDicts.** An embedded font with several FontDicts (Noto Sans CJK has
+    one per glyph class, and a subset keeps those its glyphs use) files the
+    glyph under the FontDict whose Private dict is the donor glyph's (see
+    :func:`_cff_private_values`), else FD 0. The drawn charstring has no hints
+    and calls no subroutines, so the FontDict only decides how the width is
+    encoded: against that Private dict's ``nominalWidthX`` / ``defaultWidthX``.
+
     Slice-1 scope is enforced by hard refusals (each a ``FontNotFoundError``,
     in ``_FONT_EXTEND_FAIL_EXCS``): non-CFF embedded/donor, non-CID-keyed
-    (no ``ROS``) embedded, multi-FD embedded, ``unitsPerEm`` mismatch, donor
-    char absent from the donor cmap, and seac/composite donor glyph. Every
-    out-of-scope shape REFUSES rather than producing a wrong glyph (INV-C-13).
+    (no ``ROS``) embedded, ``unitsPerEm`` mismatch, donor char absent from the
+    donor cmap, and seac/composite donor glyph. Every out-of-scope shape
+    REFUSES rather than producing a wrong glyph (INV-C-13).
 
     Args:
         embedded: Destination ``TTFont`` (the embedded CID-keyed CFF).
@@ -1515,13 +1545,11 @@ def _inject_cff_glyph_in_place(
     s_cff = system["CFF "].cff
     s_td = s_cff[s_cff.fontNames[0]]
 
-    # 3. CID-keyed gate + single-FD gate.
+    # 3. CID-keyed gate.
     # "slice-1" = the v0.2.0 C.3 CFF-injection scope; kept out of user-facing
     # strings (B10) — internal scope jargon belongs in comments, not messages.
     if not hasattr(e_td, "ROS"):
         raise FontNotFoundError("CFF injection requires a CID-keyed (ROS) embedded font")
-    if len(e_td.FDArray) != 1:
-        raise FontNotFoundError("multi-FD CID CFF is unsupported")
 
     # 4. unitsPerEm parity (no outline rescaling in slice-1).
     embedded_upem = embedded["head"].unitsPerEm
@@ -1567,9 +1595,19 @@ def _inject_cff_glyph_in_place(
     embedded_hmtx = embedded["hmtx"]
 
     cs = e_td.CharStrings
-    fd_private = e_td.FDArray[0].Private
+    pad_private = e_td.FDArray[0].Private
+    donor_values = _cff_private_values(s_td.CharStrings[donor_name].private)
+    fd_index = next(
+        (
+            index
+            for index, font_dict in enumerate(e_td.FDArray)
+            if _cff_private_values(font_dict.Private) == donor_values
+        ),
+        0,
+    )
+    fd_private = e_td.FDArray[fd_index].Private
 
-    def _append_cff_glyph(name: str, charstring: object, advance: int, lsb: int) -> None:
+    def _append_cff_glyph(name: str, charstring: object, advance: int, lsb: int, fd: int) -> None:
         """Append one glyph (charstring + charset + FDSelect + order + hmtx).
 
         Shared by the empty pad placeholders and the real donor glyph. Uses the
@@ -1585,7 +1623,7 @@ def _inject_cff_glyph_in_place(
         else:
             cs.charStrings[name] = charstring
         e_td.charset.append(name)
-        e_td.FDSelect.gidArray.append(0)
+        e_td.FDSelect.gidArray.append(fd)
         glyph_order.append(name)
         embedded_hmtx[name] = (advance, lsb)
 
@@ -1605,21 +1643,27 @@ def _inject_cff_glyph_in_place(
         pad_cid = _next_free_cid()
         pad_name = f"cid{pad_cid:05d}"
         empty_cs = T2CharString(
-            program=["endchar"], private=fd_private, globalSubrs=e_td.GlobalSubrs
+            program=["endchar"], private=pad_private, globalSubrs=e_td.GlobalSubrs
         )
-        _append_cff_glyph(pad_name, empty_cs, 0, 0)
+        _append_cff_glyph(pad_name, empty_cs, 0, 0, 0)
 
     # 8. Draw the donor outline into the embedded CFF context (flattens subrs)
-    #    and append the real glyph at GID == new_cid.
+    #    and append the real glyph at GID == new_cid. A Type 2 width operand is
+    #    relative to nominalWidthX and left out when it is defaultWidthX.
     donor_glyph_set = system.getGlyphSet()
     donor_advance, donor_lsb = system["hmtx"][donor_name]
-    pen = T2CharStringPen(donor_advance, donor_glyph_set)
+    width_operand = (
+        None
+        if donor_advance == fd_private.defaultWidthX
+        else donor_advance - fd_private.nominalWidthX
+    )
+    pen = T2CharStringPen(width_operand, donor_glyph_set)
     donor_glyph_set[donor_name].draw(pen)
     drawn = pen.getCharString(private=fd_private, globalSubrs=e_td.GlobalSubrs)
     new_cs = T2CharString(
         program=list(drawn.program), private=fd_private, globalSubrs=e_td.GlobalSubrs
     )
-    _append_cff_glyph(new_name, new_cs, donor_advance, donor_lsb)
+    _append_cff_glyph(new_name, new_cs, donor_advance, donor_lsb, fd_index)
 
     # 9. Finalize CID-keyed dicts + glyph order + maxp now that every slot has
     #    been appended (FDSelect.numGlyphs, CIDCount, glyphOrder, maxp).
@@ -2277,7 +2321,7 @@ def _extend_cff_tier(
             # embedded charset's own CIDs; min_cid threads the /ToUnicode floor
             # so a new glyph clears BOTH (mirrors the glyf path, INV-C-12).
             existing_tounicode = _parse_existing_tounicode(font_dict)
-            reverse = {ord(u): cid for cid, u in existing_tounicode.items()}
+            reverse = {ord(u): cid for cid, u in existing_tounicode.items() if len(u) == 1}
             min_cid = max(existing_tounicode.keys(), default=-1) + 1
 
             for ch in additional_chars:

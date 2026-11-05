@@ -100,9 +100,11 @@ Out of scope:
 - **CFF / OpenType fonts**. As of v0.2.0, CID-keyed (Type0)
   CFF / Type1C fonts ARE extended in place (C.3). The remaining CFF
   shapes the injector does not cover — simple-font (non-CID) CFF,
-  CFF2, name-keyed CFF, multi-FD CID, and composite donors — refuse
-  honestly (`FontNotFoundError` → a `font_extension_failed`
-  Degradation, `success=False`). Either way the failure mode is a
+  CFF2, name-keyed CFF, and composite donors — refuse honestly
+  (`FontNotFoundError` → a `font_extension_failed` Degradation,
+  `success=False`). A CID-keyed CFF with several FontDicts is extended,
+  the new glyph going under the FontDict whose Private dict is the donor
+  glyph's (FD 0 when none is). Either way the failure mode is a
   caller-visible signal, never silent corruption.
 
 ## Reporting a vulnerability
